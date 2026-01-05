@@ -61,7 +61,7 @@ class QSANClient:
         self.timeout = timeout
         self.retry_count = retry_count
 
-        self.base_url = f"{protocol}://{host}:{port}/api"
+        self.base_url = f"{protocol}://{host}:{port}"
         self.session = None
         self.session_token = None
 
@@ -73,15 +73,18 @@ class QSANClient:
     def login(self):
         """Authenticate with the QSAN storage system.
 
+        Uses /auth/get endpoint as per API_REFERENCE.md.
+
         :raises QSANApiException: If authentication fails
         """
         if self.session is None:
             self._create_session()
 
-        url = f"{self.base_url}/login"
+        url = f"{self.base_url}/auth/get"
         data = {
-            'username': self.username,
+            'user': self.username,
             'password': self.password,
+            'scopes': 'all',
         }
 
         try:
@@ -92,7 +95,8 @@ class QSANClient:
             )
             response.raise_for_status()
             result = response.json()
-            self.session_token = result.get('token')
+            # Token may be returned as 'token' or 'accessToken'
+            self.session_token = result.get('token') or result.get('accessToken')
             LOG.debug("Successfully logged in to QSAN storage at %s",
                       self.host)
         except requests.exceptions.RequestException as e:
@@ -101,13 +105,16 @@ class QSANClient:
             raise QSANApiException(message=msg)
 
     def logout(self):
-        """Logout from the QSAN storage system."""
+        """Logout from the QSAN storage system.
+
+        Uses /auth/revoke endpoint as per API_REFERENCE.md.
+        """
         if self.session is None or self.session_token is None:
             return
 
-        url = f"{self.base_url}/logout"
+        url = f"{self.base_url}/auth/revoke"
         try:
-            self._request('POST', url)
+            self._request('POST', url, data={'refreshToken': self.session_token})
             LOG.debug("Successfully logged out from QSAN storage at %s",
                       self.host)
         except Exception:
@@ -160,48 +167,56 @@ class QSANClient:
     def create_volume(self, pool_name, volume_name, size_gb, thin=True):
         """Create a volume on the QSAN storage.
 
+        Uses /rest/v2/storage/block/volumes endpoint as per API_REFERENCE.md.
+
         :param pool_name: Name of the storage pool
         :param volume_name: Name of the volume to create
         :param size_gb: Size of the volume in GB
         :param thin: Whether to create a thin-provisioned volume
         :returns: Volume information dictionary
         """
-        url = f"{self.base_url}/volumes"
+        url = f"{self.base_url}/rest/v2/storage/block/volumes"
         data = {
-            'pool': pool_name,
+            'poolId': pool_name,
             'name': volume_name,
-            'size': size_gb * units.Gi,
-            'thin_provision': thin,
+            'totalSize': size_gb * units.Gi // units.Mi,  # API expects MB
+            'type': 'THIN' if thin else 'RAID',
         }
         return self._request('POST', url, data=data)
 
     def delete_volume(self, volume_name):
         """Delete a volume from the QSAN storage.
 
+        Uses /rest/v2/storage/block/volumes/:volumeId endpoint.
+
         :param volume_name: Name of the volume to delete
         """
-        url = f"{self.base_url}/volumes/{volume_name}"
+        url = f"{self.base_url}/rest/v2/storage/block/volumes/{volume_name}"
         return self._request('DELETE', url)
 
     def extend_volume(self, volume_name, new_size_gb):
         """Extend a volume on the QSAN storage.
 
+        Uses /rest/v2/storage/block/volumes/:volumeId endpoint.
+
         :param volume_name: Name of the volume to extend
         :param new_size_gb: New size of the volume in GB
         """
-        url = f"{self.base_url}/volumes/{volume_name}"
+        url = f"{self.base_url}/rest/v2/storage/block/volumes/{volume_name}"
         data = {
-            'size': new_size_gb * units.Gi,
+            'totalSize': new_size_gb * units.Gi // units.Mi,  # API expects MB
         }
-        return self._request('PUT', url, data=data)
+        return self._request('PATCH', url, data=data)
 
     def get_volume(self, volume_name):
         """Get information about a volume.
 
+        Uses /rest/v2/storage/block/volumes/:volumeId endpoint.
+
         :param volume_name: Name of the volume
         :returns: Volume information dictionary or None if not found
         """
-        url = f"{self.base_url}/volumes/{volume_name}"
+        url = f"{self.base_url}/rest/v2/storage/block/volumes/{volume_name}"
         try:
             return self._request('GET', url)
         except QSANApiException:
@@ -212,11 +227,13 @@ class QSANClient:
     def create_snapshot(self, volume_name, snapshot_name):
         """Create a snapshot of a volume.
 
+        Uses /rest/v2/backup/snapshot/targets/:volId/snapshots endpoint.
+
         :param volume_name: Name of the source volume
         :param snapshot_name: Name for the new snapshot
         :returns: Snapshot information dictionary
         """
-        url = f"{self.base_url}/volumes/{volume_name}/snapshots"
+        url = f"{self.base_url}/rest/v2/backup/snapshot/targets/{volume_name}/snapshots"
         data = {
             'name': snapshot_name,
         }
@@ -225,20 +242,24 @@ class QSANClient:
     def delete_snapshot(self, volume_name, snapshot_name):
         """Delete a snapshot.
 
+        Uses /rest/v2/backup/snapshot/targets/:volId/snapshots/:snapId endpoint.
+
         :param volume_name: Name of the source volume
         :param snapshot_name: Name of the snapshot to delete
         """
-        url = f"{self.base_url}/volumes/{volume_name}/snapshots/{snapshot_name}"
+        url = f"{self.base_url}/rest/v2/backup/snapshot/targets/{volume_name}/snapshots/{snapshot_name}"
         return self._request('DELETE', url)
 
     def get_snapshot(self, volume_name, snapshot_name):
         """Get information about a snapshot.
 
+        Uses /rest/v2/backup/snapshot/targets/:volId/snapshots/:snapId endpoint.
+
         :param volume_name: Name of the source volume
         :param snapshot_name: Name of the snapshot
         :returns: Snapshot information dictionary or None if not found
         """
-        url = f"{self.base_url}/volumes/{volume_name}/snapshots/{snapshot_name}"
+        url = f"{self.base_url}/rest/v2/backup/snapshot/targets/{volume_name}/snapshots/{snapshot_name}"
         try:
             return self._request('GET', url)
         except QSANApiException:
@@ -249,22 +270,26 @@ class QSANClient:
     def clone_volume(self, src_volume_name, dst_volume_name, snapshot_name=None):
         """Clone a volume.
 
+        Uses /rest/v2/storage/block/volumes/:volumeId/clone endpoint.
+
         :param src_volume_name: Name of the source volume
         :param dst_volume_name: Name for the new volume
         :param snapshot_name: Optional snapshot to clone from
         :returns: New volume information dictionary
         """
-        url = f"{self.base_url}/volumes/{src_volume_name}/clone"
+        url = f"{self.base_url}/rest/v2/storage/block/volumes/{src_volume_name}/clone"
         data = {
-            'name': dst_volume_name,
+            'volumeName': dst_volume_name,
         }
         if snapshot_name:
-            data['snapshot'] = snapshot_name
+            data['snapshotId'] = snapshot_name
         return self._request('POST', url, data=data)
 
     def create_volume_from_snapshot(self, snapshot_volume_name, snapshot_name,
                                     new_volume_name, size_gb=None):
         """Create a new volume from a snapshot.
+
+        Uses /rest/v2/storage/block/volumes/:volumeId/clone endpoint with snapshotId.
 
         :param snapshot_volume_name: Name of the volume the snapshot belongs to
         :param snapshot_name: Name of the snapshot
@@ -272,12 +297,11 @@ class QSANClient:
         :param size_gb: Optional new size in GB (must be >= snapshot size)
         :returns: New volume information dictionary
         """
-        url = f"{self.base_url}/volumes/{snapshot_volume_name}/snapshots/{snapshot_name}/clone"
+        url = f"{self.base_url}/rest/v2/storage/block/volumes/{snapshot_volume_name}/clone"
         data = {
-            'name': new_volume_name,
+            'volumeName': new_volume_name,
+            'snapshotId': snapshot_name,
         }
-        if size_gb:
-            data['size'] = size_gb * units.Gi
         return self._request('POST', url, data=data)
 
     # ========== Pool Operations ==========
@@ -285,10 +309,12 @@ class QSANClient:
     def get_pool(self, pool_name):
         """Get information about a storage pool.
 
+        Uses /rest/v2/storage/pools/:poolId endpoint.
+
         :param pool_name: Name of the pool
         :returns: Pool information dictionary
         """
-        url = f"{self.base_url}/pools/{pool_name}"
+        url = f"{self.base_url}/rest/v2/storage/pools/{pool_name}"
         return self._request('GET', url)
 
     def get_pool_stats(self, pool_name):
@@ -298,10 +324,14 @@ class QSANClient:
         :returns: Dictionary with total_capacity and free_capacity in bytes
         """
         pool_info = self.get_pool(pool_name)
+        # API returns sizes, convert to bytes if needed
+        total = pool_info.get('totalSize', 0) or pool_info.get('total_capacity', 0)
+        free = pool_info.get('freeSize', 0) or pool_info.get('free_capacity', 0)
+        used = pool_info.get('usedSize', 0) or pool_info.get('used_capacity', 0)
         return {
-            'total_capacity': pool_info.get('total_capacity', 0),
-            'free_capacity': pool_info.get('free_capacity', 0),
-            'used_capacity': pool_info.get('used_capacity', 0),
+            'total_capacity': total,
+            'free_capacity': free,
+            'used_capacity': used,
         }
 
     # ========== iSCSI Operations ==========
@@ -309,11 +339,13 @@ class QSANClient:
     def create_iscsi_target(self, target_name, target_iqn=None):
         """Create an iSCSI target.
 
+        Uses /rest/v2/dataTransfer/targets endpoint.
+
         :param target_name: Name for the target
         :param target_iqn: Optional custom IQN, auto-generated if not provided
         :returns: Target information including IQN
         """
-        url = f"{self.base_url}/iscsi/targets"
+        url = f"{self.base_url}/rest/v2/dataTransfer/targets"
         data = {
             'name': target_name,
         }
@@ -324,32 +356,41 @@ class QSANClient:
     def delete_iscsi_target(self, target_id):
         """Delete an iSCSI target.
 
+        Uses /rest/v2/dataTransfer/targets/:targetId endpoint.
+
         :param target_id: ID of the target to delete
         """
-        url = f"{self.base_url}/iscsi/targets/{target_id}"
+        url = f"{self.base_url}/rest/v2/dataTransfer/targets/{target_id}"
         return self._request('DELETE', url)
 
     def get_iscsi_target(self, target_id):
         """Get information about an iSCSI target.
 
+        Uses /rest/v2/dataTransfer/targets/:targetId endpoint.
+
         :param target_id: ID of the target
         :returns: Target information dictionary
         """
-        url = f"{self.base_url}/iscsi/targets/{target_id}"
+        url = f"{self.base_url}/rest/v2/dataTransfer/targets/{target_id}"
         return self._request('GET', url)
 
     def get_iscsi_target_by_name(self, target_name):
         """Get iSCSI target by name.
 
+        Uses /rest/v2/dataTransfer/targets endpoint with filtering.
+
         :param target_name: Name of the target
         :returns: Target information dictionary or None if not found
         """
-        url = f"{self.base_url}/iscsi/targets"
-        params = {'name': target_name}
+        url = f"{self.base_url}/rest/v2/dataTransfer/targets"
         try:
-            result = self._request('GET', url, params=params)
-            if result and len(result) > 0:
-                return result[0]
+            result = self._request('GET', url)
+            if result:
+                # Filter by name
+                targets = result if isinstance(result, list) else result.get('data', [])
+                for target in targets:
+                    if target.get('name') == target_name:
+                        return target
             return None
         except QSANApiException:
             return None
@@ -357,12 +398,14 @@ class QSANClient:
     def map_volume_to_target(self, volume_name, target_id, lun_id=None):
         """Map a volume to an iSCSI target.
 
+        Uses /rest/v2/dataTransfer/targets/:targetId/luns endpoint.
+
         :param volume_name: Name of the volume to map
         :param target_id: ID of the target
         :param lun_id: Optional specific LUN ID, auto-assigned if not provided
         :returns: Mapping information including LUN ID
         """
-        url = f"{self.base_url}/iscsi/targets/{target_id}/luns"
+        url = f"{self.base_url}/rest/v2/dataTransfer/targets/{target_id}/luns"
         data = {
             'volume': volume_name,
         }
@@ -373,19 +416,23 @@ class QSANClient:
     def unmap_volume_from_target(self, target_id, lun_id):
         """Unmap a volume from an iSCSI target.
 
+        Uses /rest/v2/dataTransfer/targets/:targetId/luns/:lunId endpoint.
+
         :param target_id: ID of the target
         :param lun_id: LUN ID to unmap
         """
-        url = f"{self.base_url}/iscsi/targets/{target_id}/luns/{lun_id}"
+        url = f"{self.base_url}/rest/v2/dataTransfer/targets/{target_id}/luns/{lun_id}"
         return self._request('DELETE', url)
 
     def get_target_luns(self, target_id):
         """Get all LUN mappings for a target.
 
+        Uses /rest/v2/dataTransfer/targets/:targetId/luns endpoint.
+
         :param target_id: ID of the target
         :returns: List of LUN mapping dictionaries
         """
-        url = f"{self.base_url}/iscsi/targets/{target_id}/luns"
+        url = f"{self.base_url}/rest/v2/dataTransfer/targets/{target_id}/luns"
         return self._request('GET', url)
 
     def get_volume_lun_mapping(self, volume_name):
@@ -394,23 +441,41 @@ class QSANClient:
         :param volume_name: Name of the volume
         :returns: Mapping information or None if not mapped
         """
-        url = f"{self.base_url}/volumes/{volume_name}/mapping"
+        # This may need to iterate through targets to find the mapping
+        url = f"{self.base_url}/rest/v2/dataTransfer/targets"
         try:
-            return self._request('GET', url)
+            result = self._request('GET', url)
+            if result:
+                targets = result if isinstance(result, list) else result.get('data', [])
+                for target in targets:
+                    target_id = target.get('id')
+                    luns = self.get_target_luns(target_id)
+                    if luns:
+                        for lun in luns:
+                            if lun.get('volume') == volume_name:
+                                return {
+                                    'volume': volume_name,
+                                    'target_id': target_id,
+                                    'target_iqn': target.get('iqn'),
+                                    'lun_id': lun.get('lun_id'),
+                                }
+            return None
         except QSANApiException:
             return None
 
     def add_initiator_to_target(self, target_id, initiator_iqn):
         """Add an initiator to an iSCSI target's ACL.
 
+        Uses /rest/v2/dataTransfer/targets/:targetId/host endpoint.
+
         :param target_id: ID of the target
         :param initiator_iqn: IQN of the initiator to add
         """
-        url = f"{self.base_url}/iscsi/targets/{target_id}/acl"
+        url = f"{self.base_url}/rest/v2/dataTransfer/targets/{target_id}/host"
         data = {
             'initiator': initiator_iqn,
         }
-        return self._request('POST', url, data=data)
+        return self._request('PUT', url, data=data)
 
     def remove_initiator_from_target(self, target_id, initiator_iqn):
         """Remove an initiator from an iSCSI target's ACL.
@@ -418,17 +483,23 @@ class QSANClient:
         :param target_id: ID of the target
         :param initiator_iqn: IQN of the initiator to remove
         """
-        url = f"{self.base_url}/iscsi/targets/{target_id}/acl/{initiator_iqn}"
-        return self._request('DELETE', url)
+        url = f"{self.base_url}/rest/v2/dataTransfer/targets/{target_id}/host"
+        data = {
+            'initiator': initiator_iqn,
+            'action': 'remove',
+        }
+        return self._request('PUT', url, data=data)
 
     def set_target_chap(self, target_id, username, password):
         """Set CHAP authentication for a target.
+
+        Uses /rest/v2/dataTransfer/targets/:targetId/CHAP endpoint.
 
         :param target_id: ID of the target
         :param username: CHAP username
         :param password: CHAP password
         """
-        url = f"{self.base_url}/iscsi/targets/{target_id}/chap"
+        url = f"{self.base_url}/rest/v2/dataTransfer/targets/{target_id}/CHAP"
         data = {
             'username': username,
             'password': password,
@@ -438,20 +509,43 @@ class QSANClient:
     def get_iscsi_portals(self):
         """Get list of iSCSI portal IPs.
 
+        Uses /rest/v2/network/ethernet endpoint to get network interfaces.
+
         :returns: List of portal IP addresses
         """
-        url = f"{self.base_url}/iscsi/portals"
-        result = self._request('GET', url)
-        return result.get('portals', [])
+        url = f"{self.base_url}/rest/v2/network/ethernet"
+        try:
+            result = self._request('GET', url)
+            portals = []
+            if result:
+                interfaces = result if isinstance(result, list) else result.get('data', [])
+                for iface in interfaces:
+                    ipv4 = iface.get('ipv4', {})
+                    ip = ipv4.get('ip')
+                    if ip and iface.get('online'):
+                        portals.append(ip)
+            return portals
+        except QSANApiException:
+            return []
 
     # ========== System Operations ==========
 
     def get_system_info(self):
-        """Get system information from the QSAN storage.
+        """Get system information from the QSAN storage (legacy API).
 
         :returns: System information dictionary
         """
-        url = f"{self.base_url}/system"
+        url = f"{self.base_url}/api/system"
+        return self._request('GET', url)
+
+    def get_system_info_v2(self):
+        """Get system information from the QSAN storage.
+
+        Uses /rest/v2/system/info endpoint as per API_REFERENCE.md.
+
+        :returns: System information dictionary
+        """
+        url = f"{self.base_url}/rest/v2/system/info"
         return self._request('GET', url)
 
     def get_system_version(self):
@@ -459,13 +553,19 @@ class QSANClient:
 
         :returns: Version string
         """
-        info = self.get_system_info()
-        return info.get('version', 'unknown')
+        try:
+            info = self.get_system_info_v2()
+            return info.get('version', info.get('firmwareVersion', 'unknown'))
+        except QSANApiException:
+            return 'unknown'
 
     def get_iscsi_iqn_prefix(self):
         """Get the iSCSI IQN prefix for this storage system.
 
         :returns: IQN prefix string
         """
-        info = self.get_system_info()
-        return info.get('iscsi_iqn_prefix', 'iqn.2004-08.com.qsan')
+        try:
+            info = self.get_system_info_v2()
+            return info.get('iscsi_iqn_prefix', 'iqn.2004-08.com.qsan')
+        except QSANApiException:
+            return 'iqn.2004-08.com.qsan'

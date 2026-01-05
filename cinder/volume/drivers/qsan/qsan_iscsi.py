@@ -116,9 +116,18 @@ class QSANISCSIDriver(driver.ISCSIDriver):
         )
 
         try:
+            # Login to QSAN storage using /auth/get endpoint
             self._qsan_client.login()
             LOG.info("Successfully connected to QSAN storage at %s",
                      self.configuration.qsan_management_ip)
+
+            # Fetch and log system information from /rest/v2/system/info
+            try:
+                system_info = self._qsan_client.get_system_info_v2()
+                LOG.info("QSAN System Info: %s", system_info)
+            except common.QSANApiException as e:
+                LOG.warning("Failed to get system info: %s", str(e))
+
         except common.QSANApiException as e:
             msg = _("Failed to connect to QSAN storage: %s") % str(e)
             LOG.error(msg)
